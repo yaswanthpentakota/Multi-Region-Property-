@@ -1,6 +1,6 @@
 import json
 import logging
-from fastapi import APIRouter, Request, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header
 from typing import Optional
 
 from database import get_pool
@@ -10,6 +10,29 @@ from config import REGION
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+@router.get("/{region}/properties/{property_id}")
+async def get_property(region: str, property_id: int):
+    """Fetch a single property by ID."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, price, bedrooms, bathrooms, region_origin, version, updated_at "
+            "FROM properties WHERE id = $1",
+            property_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Property {property_id} not found")
+    return {
+        "id": row["id"],
+        "price": float(row["price"]),
+        "bedrooms": row["bedrooms"],
+        "bathrooms": row["bathrooms"],
+        "region_origin": row["region_origin"],
+        "version": row["version"],
+        "updated_at": row["updated_at"].isoformat(),
+    }
 
 
 @router.put("/{region}/properties/{property_id}")

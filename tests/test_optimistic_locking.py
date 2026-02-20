@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Integration test: Concurrent optimistic locking validation.
+Integration tests: Optimistic locking & Idempotency validation.
 
-Simulates two concurrent PUT requests to the same property from both regions.
-One must succeed (200) and the other must be rejected (409 Conflict).
+Tests:
+  1. Concurrent PUTs to the same property → one 200, one 409
+  2. Sequential version conflict → second PUT with stale version → 409
+  3. Duplicate X-Request-ID → second PUT → 422
 
 Usage:
-    python tests/test_optimistic_locking.py
-
-Prerequisites:
     pip install requests
-    docker-compose up -d  (and wait ~60s for all services to be healthy)
+    docker-compose up -d        # wait ~90 seconds
+    python tests/test_optimistic_locking.py
 """
 
 import sys
@@ -19,153 +19,196 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE_URL = "http://localhost:8080"
-PROPERTY_ID = 50  # Property to test – exists in both DBs
+
+GREEN  = "\033[0;32m"
+RED    = "\033[0;31m"
+YELLOW = "\033[1;33m"
+NC     = "\033[0m"
+
+def passed(msg): print(f"{GREEN}[PASS]{NC} {msg}")
+def failed(msg): print(f"{RED}[FAIL]{NC} {msg}")
+def info(msg):   print(f"{YELLOW}[INFO]{NC} {msg}")
+def sep():       print(f"\n{YELLOW}{'='*56}{NC}\n")
 
 
-def get_property(region: str) -> dict:
-    """Fetch the current state of a property."""
-    r = requests.get(f"{BASE_URL}/{region}/properties/{PROPERTY_ID}", timeout=10)
-    if r.status_code == 404:
-        # Fallback: try the other region (data is cross-replicated)
-        r = requests.get(f"{BASE_URL}/us/properties/{PROPERTY_ID}", timeout=10)
-    # If the GET route is not explicitly defined, fetch via a health check
-    return r.json() if r.ok else {}
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
+
+def get_property(region: str, prop_id: int) -> dict:
+    r = requests.get(f"{BASE_URL}/{region}/properties/{prop_id}", timeout=10)
+    if not r.ok:
+        raise RuntimeError(f"GET /{region}/properties/{prop_id} → HTTP {r.status_code}: {r.text}")
+    return r.json()
 
 
-def put_update(region: str, version: int, price: float) -> requests.Response:
-    """Send a PUT update to the given region."""
-    request_id = str(uuid.uuid4())
+def put_property(region: str, prop_id: int, version: int, price: float) -> requests.Response:
     return requests.put(
-        f"{BASE_URL}/{region}/properties/{PROPERTY_ID}",
+        f"{BASE_URL}/{region}/properties/{prop_id}",
         json={"price": price, "version": version},
-        headers={"X-Request-ID": request_id, "Content-Type": "application/json"},
+        headers={
+            "X-Request-ID":   str(uuid.uuid4()),
+            "Content-Type":   "application/json",
+        },
         timeout=15,
     )
 
+
+# ─────────────────────────────────────────────────────────────
+# Test 1 – Concurrent optimistic locking
+# ─────────────────────────────────────────────────────────────
 
 def test_concurrent_updates():
-    print("=" * 60)
-    print("TEST: Concurrent Optimistic Locking")
-    print("=" * 60)
+    sep()
+    info("TEST 1: Concurrent Optimistic Locking (race condition simulation)")
 
-    # ── Step 1: Get the current version from db-us ──────────────────
-    # We directly hit the backend-us to read the current version
-    r = requests.get(f"{BASE_URL}/us/health", timeout=5)
-    assert r.status_code == 200, "US backend is not healthy!"
+    PROP_ID = 10
 
-    # Read current version via a direct DB-like approach (health confirms region)
-    # We'll use version=1 as starting assumption; if it fails we adjust
-    print(f"\nSending 2 concurrent PUT requests to /us/properties/{PROPERTY_ID} with the SAME version...")
+    # Get live current version
+    prop = get_property("us", PROP_ID)
+    current_version = prop["version"]
+    info(f"Property {PROP_ID} current version = {current_version}")
 
-    # ── Step 2: Send two concurrent requests with the same version ───
-    # Both will race; the DB's WHERE version=N guard ensures only one wins
+    info("Launching 2 concurrent PUTs with the same version …")
     results = []
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=2) as ex:
         futures = [
-            executor.submit(put_update, "us", 1, 600000.00),
-            executor.submit(put_update, "us", 1, 750000.00),
+            ex.submit(put_property, "us", PROP_ID, current_version, 601000.00),
+            ex.submit(put_property, "us", PROP_ID, current_version, 702000.00),
         ]
         for f in as_completed(futures):
-            resp = f.result()
-            results.append(resp)
-            print(f"  Response: HTTP {resp.status_code} | Body: {resp.text[:200]}")
+            r = f.result()
+            results.append(r)
+            print(f"    HTTP {r.status_code}  →  {r.text[:120]}")
 
-    statuses = [r.status_code for r in results]
-
-    # ── Step 3: Assertions ───────────────────────────────────────────
-    success_count = statuses.count(200)
-    conflict_count = statuses.count(409)
-
-    print(f"\nResults: {success_count} success(es), {conflict_count} conflict(s)")
-
-    if success_count == 1 and conflict_count == 1:
-        print("\n✅ PASS: Optimistic locking correctly allowed one update and rejected the other.")
-    elif success_count == 2:
-        # Both had version=1 but real current version may not be 1 – let's try with current version
-        print("⚠️  Both succeeded – trying with current version fetched live...")
-        test_version_conflict_explicit()
+    statuses = sorted(r.status_code for r in results)
+    if statuses == [200, 409]:
+        passed("One request succeeded (200) and the other was rejected (409) — race condition handled correctly.")
+    elif statuses == [200, 200]:
+        failed("Both succeeded — this should not happen if optimistic locking is working.")
+        sys.exit(1)
     else:
-        print("\n❓ Unexpected result – both may have failed due to version mismatch (try resetting DB).")
-        print("   This is expected if the property was already updated from a previous test run.")
-        test_version_conflict_explicit()
+        info(f"Statuses {statuses} — property may have already been at a different version. Running explicit test …")
+        test_version_conflict_explicit(PROP_ID)
 
 
-def test_version_conflict_explicit():
-    """
-    Explicitly test 409: Get current version, update it, then try to update again
-    with the OLD version number.
-    """
-    print("\n" + "=" * 60)
-    print("TEST: Explicit Version Conflict (sequential)")
-    print("=" * 60)
+# ─────────────────────────────────────────────────────────────
+# Test 2 – Explicit sequential version conflict
+# ─────────────────────────────────────────────────────────────
 
-    # First update with a fresh request ID
-    rid1 = str(uuid.uuid4())
-    r1 = requests.put(
-        f"{BASE_URL}/us/properties/{PROPERTY_ID}",
-        json={"price": 500001.00, "version": 1},
-        headers={"X-Request-ID": rid1, "Content-Type": "application/json"},
-        timeout=15,
-    )
-    print(f"\n  First PUT (version=1):  HTTP {r1.status_code}")
+def test_version_conflict_explicit(prop_id: int = 20):
+    sep()
+    info(f"TEST 2: Sequential version conflict on property {prop_id}")
 
-    # Now try the same version again
-    rid2 = str(uuid.uuid4())
-    r2 = requests.put(
-        f"{BASE_URL}/us/properties/{PROPERTY_ID}",
-        json={"price": 500002.00, "version": 1},
-        headers={"X-Request-ID": rid2, "Content-Type": "application/json"},
-        timeout=15,
-    )
-    print(f"  Second PUT (version=1): HTTP {r2.status_code}")
+    prop = get_property("us", prop_id)
+    version = prop["version"]
+    info(f"Current version = {version}")
+
+    # First update – must succeed
+    r1 = put_property("us", prop_id, version, 450001.00)
+    print(f"    First  PUT (version={version}): HTTP {r1.status_code}")
+    if r1.status_code != 200:
+        info(f"First PUT failed ({r1.status_code}) – skipping; check DB state.")
+        return
+
+    # Second update with the OLD version – must fail
+    r2 = put_property("us", prop_id, version, 450002.00)
+    print(f"    Second PUT (version={version}): HTTP {r2.status_code}  (stale version)")
 
     if r2.status_code == 409:
-        print("\n✅ PASS: Version conflict correctly returned 409.")
+        passed("Stale version correctly rejected with 409 Conflict.")
     else:
-        print(f"\n⚠️  Got HTTP {r2.status_code} – the property version may not be 1. Check the DB.")
+        failed(f"Expected 409, got {r2.status_code}. Body: {r2.text}")
 
+
+# ─────────────────────────────────────────────────────────────
+# Test 3 – Idempotency (duplicate X-Request-ID)
+# ─────────────────────────────────────────────────────────────
 
 def test_idempotency():
-    print("\n" + "=" * 60)
-    print("TEST: Idempotency (X-Request-ID deduplication)")
-    print("=" * 60)
+    sep()
+    info("TEST 3: Idempotency – duplicate X-Request-ID must return 422")
 
-    shared_request_id = str(uuid.uuid4())
+    PROP_ID = 30
+    prop = get_property("us", PROP_ID)
+    version = prop["version"]
+    shared_rid = str(uuid.uuid4())
+    info(f"Using X-Request-ID = {shared_rid}")
 
     r1 = requests.put(
-        f"{BASE_URL}/us/properties/60",
-        json={"price": 299999.00, "version": 1},
-        headers={"X-Request-ID": shared_request_id, "Content-Type": "application/json"},
+        f"{BASE_URL}/us/properties/{PROP_ID}",
+        json={"price": 299_000.00, "version": version},
+        headers={"X-Request-ID": shared_rid, "Content-Type": "application/json"},
         timeout=15,
     )
-    print(f"\n  First PUT (unique X-Request-ID):  HTTP {r1.status_code}")
+    print(f"    First  PUT: HTTP {r1.status_code}")
 
     r2 = requests.put(
-        f"{BASE_URL}/us/properties/60",
-        json={"price": 299999.00, "version": 1},
-        headers={"X-Request-ID": shared_request_id, "Content-Type": "application/json"},
+        f"{BASE_URL}/us/properties/{PROP_ID}",
+        json={"price": 299_000.00, "version": version},
+        headers={"X-Request-ID": shared_rid, "Content-Type": "application/json"},
         timeout=15,
     )
-    print(f"  Second PUT (same X-Request-ID):   HTTP {r2.status_code}")
+    print(f"    Second PUT (same X-Request-ID): HTTP {r2.status_code}  {r2.text[:120]}")
 
     if r1.status_code == 200 and r2.status_code == 422:
-        print("\n✅ PASS: Idempotency correctly rejected the duplicate request with 422.")
+        passed("Duplicate request correctly rejected with 422 Unprocessable Entity.")
     elif r1.status_code != 200:
-        print(f"\n⚠️  First request returned {r1.status_code} – version might not be 1. Adjust and retry.")
+        info(f"First request returned {r1.status_code} – property version may not match. Check DB.")
     else:
-        print(f"\n❌ FAIL: Expected 422 for duplicate, got {r2.status_code}.")
+        failed(f"Expected 422 for duplicate, got {r2.status_code}.")
 
+
+# ─────────────────────────────────────────────────────────────
+# Test 4 – Replication lag endpoint
+# ─────────────────────────────────────────────────────────────
+
+def test_replication_lag():
+    sep()
+    info("TEST 4: Replication lag endpoint returns a numeric value")
+
+    # Trigger a US update to generate a Kafka message
+    prop = get_property("us", 40)
+    r = put_property("us", 40, prop["version"], 550_000.00)
+    print(f"    Triggered US update: HTTP {r.status_code}")
+
+    import time
+    info("Waiting 3 seconds for replication …")
+    time.sleep(3)
+
+    lag_r = requests.get(f"{BASE_URL}/eu/replication-lag", timeout=10)
+    print(f"    GET /eu/replication-lag: HTTP {lag_r.status_code}  {lag_r.text}")
+
+    if lag_r.status_code == 200:
+        data = lag_r.json()
+        lag = data.get("lag_seconds", -1)
+        if isinstance(lag, (int, float)) and lag >= 0:
+            passed(f"Replication lag = {lag:.3f} seconds.")
+        else:
+            failed(f"'lag_seconds' value unexpected: {lag}")
+    else:
+        failed(f"Endpoint returned HTTP {lag_r.status_code}")
+
+
+# ─────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Confirm system is reachable
     try:
-        # Confirm system is up
         r = requests.get(f"{BASE_URL}/us/health", timeout=5)
         r.raise_for_status()
+        info(f"System healthy: {r.json()}")
     except Exception as e:
-        print(f"❌ System not reachable at {BASE_URL}: {e}")
-        print("   Run: docker-compose up -d  and wait ~60 seconds")
+        print(f"{RED}[ERROR]{NC} System not reachable at {BASE_URL}: {e}")
+        print("  → Run: docker-compose up -d  and wait ~90 seconds")
         sys.exit(1)
 
     test_concurrent_updates()
+    test_version_conflict_explicit()
     test_idempotency()
-    print("\nAll tests complete.")
+    test_replication_lag()
+
+    sep()
+    print(f"{GREEN}All tests completed.{NC}")

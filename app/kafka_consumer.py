@@ -3,6 +3,7 @@ import logging
 import threading
 import asyncio
 from datetime import datetime, timezone
+from typing import Optional
 from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 import time
@@ -12,8 +13,8 @@ from config import KAFKA_BROKER, KAFKA_TOPIC, REGION
 logger = logging.getLogger(__name__)
 
 # Shared state – last consumed message timestamp for replication-lag endpoint
-last_consumed_at: datetime | None = None
-_loop: asyncio.AbstractEventLoop | None = None
+last_consumed_at: Optional[datetime] = None
+_loop: Optional[asyncio.AbstractEventLoop] = None
 _pool = None  # will be injected at startup
 
 
