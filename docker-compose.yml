@@ -19,7 +19,7 @@ services:
       test: [ "CMD", "service", "nginx", "status" ]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 3
     restart: unless-stopped
 
   # ── Zookeeper (Kafka dependency) ─────────────────────────────────────────
@@ -29,11 +29,6 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
-    healthcheck:
-      test: [ "CMD", "bash", "-c", "echo ruok | nc localhost 2181 | grep imok" ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
     restart: unless-stopped
 
   # ── Kafka broker ─────────────────────────────────────────────────────────
@@ -41,8 +36,7 @@ services:
     image: confluentinc/cp-kafka:7.0.1
     container_name: kafka
     depends_on:
-      zookeeper:
-        condition: service_healthy
+      - zookeeper
     ports:
       - "9092:9092"
     environment:
@@ -54,11 +48,6 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-    healthcheck:
-      test: [ "CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092" ]
-      interval: 15s
-      timeout: 10s
-      retries: 10
     restart: unless-stopped
 
   # ── US PostgreSQL database ───────────────────────────────────────────────
@@ -72,11 +61,6 @@ services:
     volumes:
       - db_us_data:/var/lib/postgresql/data
       - ./seeds/init-us.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-propuser} -d ${POSTGRES_DB:-properties}" ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
     restart: unless-stopped
 
   # ── EU PostgreSQL database ───────────────────────────────────────────────
@@ -90,11 +74,6 @@ services:
     volumes:
       - db_eu_data:/var/lib/postgresql/data
       - ./seeds/init-eu.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-propuser} -d ${POSTGRES_DB:-properties}" ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
     restart: unless-stopped
 
   # ── US backend service ───────────────────────────────────────────────────
@@ -107,11 +86,10 @@ services:
       - REGION=us
       - DATABASE_URL=postgresql://${POSTGRES_USER:-propuser}:${POSTGRES_PASSWORD:-proppassword}@db-us:5432/${POSTGRES_DB:-properties}
       - KAFKA_BROKER=kafka:29092
+      - PYTHONUNBUFFERED=1
     depends_on:
-      db-us:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
+      - db-us
+      - kafka
     healthcheck:
       test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
       interval: 15s
@@ -130,11 +108,10 @@ services:
       - REGION=eu
       - DATABASE_URL=postgresql://${POSTGRES_USER:-propuser}:${POSTGRES_PASSWORD:-proppassword}@db-eu:5432/${POSTGRES_DB:-properties}
       - KAFKA_BROKER=kafka:29092
+      - PYTHONUNBUFFERED=1
     depends_on:
-      db-eu:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
+      - db-eu
+      - kafka
     healthcheck:
       test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
       interval: 15s

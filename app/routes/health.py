@@ -4,5 +4,6 @@ from config import REGION
 router = APIRouter()
 
 @router.get("/health")
-async def health():
+@router.get("/{region}/health")
+async def health(region: str = None):
     return {"status": "ok", "region": REGION}
